@@ -72,24 +72,39 @@ def Transform_GDP_Daily(all_gdp):
     return df_daily
 
 
+def Transform_Rates_Daily(df_rates):
+    # rozciągnięcie wartości miesięcznych na dni
+    df_daily = df_rates.resample("D").ffill()
+    df_daily = df_daily.reset_index()
+    df_daily = df_daily.rename(columns={df_daily.columns[0]: "Date"})
+    return df_daily
 
-def Concat_Data(forex, cpi, gdp):
+
+def Concat_Data(forex, cpi, gdp, rates=None, start_date=None, end_date=None):
     # 1. Łączymy Forex z CPI po dacie
     df_combined = pd.merge(forex, cpi, on='Date', how='outer')
     
     # 2. Doklejamy PKB (GDP)
     df_final = pd.merge(df_combined, gdp, on='Date', how='outer')
+
+    # 3. Doklejamy stopy procentowe (jeśli podane)
+    if rates is not None and not rates.empty:
+        df_final = pd.merge(df_final, rates, on='Date', how='outer')
     
-    # 3. Sortujemy chronologicznie
+    # 4. Sortujemy chronologicznie
     df_final = df_final.sort_values('Date').reset_index(drop=True)
     
-    # 4. Usuwamy wiersze, które zawierają JAKIKOLWIEK null (NaN)
-    # axis=0 oznacza wiersze, how='any' oznacza: usuń jeśli choć jedna komórka jest pusta
+    # 5. Rozciągnięcie do pełnego zakresu dat (każdy dzień miesiąca)
+    if start_date and end_date:
+        full_range = pd.date_range(start=start_date, end=end_date, freq="D")
+        df_final = df_final.set_index('Date').reindex(full_range).ffill().reset_index()
+        df_final = df_final.rename(columns={"index": "Date"})
+    
+    # 6. Usuwamy wiersze, które zawierają JAKIKOLWIEK null (NaN)
     df_final = df_final.dropna(axis=0, how='any')
     
-    # Resetujemy indeks po usunięciu wierszy, żeby numery szły po kolei (0, 1, 2...)
+    # Resetujemy indeks po usunięciu wierszy
     df_final = df_final.reset_index(drop=True)
     
-
     #show(df_final)
     return df_final

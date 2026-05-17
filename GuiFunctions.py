@@ -2,7 +2,7 @@ import pandas as pd
 import os
 from pandasgui import show
 
-from DataDownloader import Forex_Downloader, CPI_Monthly_Downloader, GDP_Downloader
+from DataDownloader import Forex_Downloader, CPI_Monthly_Downloader, GDP_Downloader, Interest_Rates_Downloader
 from DataTransformer import Concat_Data
 
 
@@ -14,7 +14,13 @@ def Download_Data(dates = '2020:2024', countries = ['GB','DEU', 'FRA', 'ITA', 'U
     forex = (Forex_Downloader(dates))
     cpi = (CPI_Monthly_Downloader())
     gdp = (GDP_Downloader(countries, dates))
-    df_final = Concat_Data(forex, cpi, gdp)
+    rates = (Interest_Rates_Downloader())
+
+    lewa, prawa = dates.split(':')
+    start_date = f"{lewa}-01-01"
+    end_date = f"{prawa}-12-31"
+
+    df_final = Concat_Data(forex, cpi, gdp, rates, start_date, end_date)
     df_final.to_csv(sciezka_pliku, index=False)
     print("Dane zostały zapisane do pliku {sciezka_pliku}")
 

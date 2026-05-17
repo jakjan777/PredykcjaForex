@@ -4,7 +4,7 @@ import pandas as pd
 from pandasgui import show
 import pandas_datareader.data as web
 
-from DataTransformer import Transform_Forex_Add_Weekends, Transform_CPI_Daily, Transform_GDP_Daily
+from DataTransformer import Transform_Forex_Add_Weekends, Transform_CPI_Daily, Transform_GDP_Daily, Transform_Rates_Daily
 from DataTransformer import Concat_Data
 
 
@@ -67,6 +67,40 @@ def CPI_Monthly_Downloader(start_date="2020-01-01", end_date="2026-01-01"):
     except Exception as e:
         print(f"Błąd przy pobieraniu danych miesięcznych: {e}")
         return pd.DataFrame()
+
+
+###Pobieranie stóp procentowych z FRED
+def Interest_Rates_Downloader(start_date="2020-01-01", end_date="2026-01-01"):
+
+    original_start = start_date
+    r, m, d = start_date.split("-")
+    r = int(r) - 1
+    start_date_extended = f"{r}-{m}-{d}"
+
+    # Każda seria pobierana osobno (jedna może nie istnieć, reszta działa)
+    series_map = {
+        'US_FED_IR': 'FEDFUNDS',
+        'EA_ECB_IR': 'ECBMRRFR',
+        'PL_NBP_IR': 'IRSTCI01PLM156N'
+    }
+
+    results = {}
+    for name, sid in series_map.items():
+        try:
+            df = web.DataReader(sid, 'fred', start_date_extended, end_date)
+            results[name] = df[sid]
+            print(f"Pobrano {name} ({sid})")
+        except Exception as e:
+            print(f"Ostrzeżenie: nie można pobrać {name} ({sid}): {e}")
+
+    if not results:
+        print("Błąd: nie pobrano żadnych stóp procentowych.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(results)
+    df = df[df.index >= original_start]
+
+    return Transform_Rates_Daily(df)
 
 
 ###Pobieranie PKB dla wybranych krajów
