@@ -1,361 +1,464 @@
-from tensorflow import keras
-import pandas as pd
+import random
 import numpy as np
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-import os
-from datetime import datetime
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.dates as mdates
+from tensorflow import keras
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (mean_squared_error, mean_absolute_error, r2_score,
+                             confusion_matrix, accuracy_score,
+                             precision_score, recall_score, f1_score)
+
+# reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+keras.utils.set_random_seed(SEED)
 
 sliding_window = 60
-
+prediction_horizon = 5
 
 sciezka_pliku = "dane_ekonomiczne.csv"
-
-columns = ["Close_USDPLN", "Close_EURPLN", "Close_EURUSD", "Close_EURGBP"]
-
 data = pd.read_csv(sciezka_pliku)
-data_raw = data[['Date', 'Close_USDPLN']].copy()
 
 print(data.info)
 print(data.describe)
 print(data.dtypes)
 
-#TODO dodac seedy i porównać różne treningi
-
-
-#wizualizacja danych
-def usd_pln_vis():
-    plt.figure(figsize=(12,6))
-    plt.plot(data['Date'], data['Close_USDPLN'], label="close USD/PLN", color="red")
-    plt.title("open-close USD/PLN")
-    plt.legend()
-    plt.show()
-
-
-#dropping columns that are not important right now
 # pozostawiamy tylko OHLCV dla USDPLN (reszta niepotrzebna)
 data = data.drop(columns=["High_EURPLN", "Low_EURPLN", "Open_EURPLN", "Volume_EURPLN",
                           "High_EURUSD", "Low_EURUSD", "Open_EURUSD", "Volume_EURUSD",
                           "High_EURGBP", "Low_EURGBP", "Open_EURGBP", "Volume_EURGBP"])
 
-#dropping non numeric data (dates)
-data_numeric = data.select_dtypes(include=["int64", "float64"])
-
-#sprawdzanie koleracji (heatmap)
-def heatmap():
-    plt.figure(figsize=(16,9))
-    sns.heatmap(data_numeric.corr(), annot=True, cmap="coolwarm")
-    plt.title("feature corelation")
-    plt.show()
-#heatmap()
-
-#konwersja daty na prawidlowy obiekt
+# konwersja daty i usunięcie weekendów (sobota=5, niedziela=6)
 data['Date'] = pd.to_datetime(data['Date'])
+data = data[~data['Date'].dt.dayofweek.isin([5, 6])].reset_index(drop=True)
 
-
-# ograniczenie przedzialu czasowego
-# data = data.loc[
-#     (data['Date'] > datetime(2023,1,1)) &
-#     (data['Date'] < datetime(2023,12,31))
-# ].copy()
-
-#TODO dodac więcej zależności między walutami
-
-#TODO zmiany wahania kursów walut
 close_original = data["Close_USDPLN"].copy()
 high_original = data["High_USDPLN"].copy()
 low_original = data["Low_USDPLN"].copy()
+open_original = data["Open_USDPLN"].copy()
 volume_original = data["Volume_USDPLN"].copy()
-data["Close_USDPLN"] = data["Close_USDPLN"].pct_change()
+
+# target z skumulowanego zwrotu (ciągła stopa zwrotu za prediction_horizon dni, w procentach)
+target = (close_original.shift(-prediction_horizon) / close_original - 1) * 100
+data["target"] = target
+
+# target dla wolumenu (procentowa zmiana wolumenu za prediction_horizon dni)
+volume_has_data = volume_original.nunique() > 1
+if volume_has_data:
+    volume_target = (volume_original.shift(-prediction_horizon) / volume_original.replace(0, np.nan) - 1) * 100
+else:
+    print("UWAGA: Volume_USDPLN ma wszystkie wartości 0 — wolumen nie będzie przewidywany")
+    volume_target = pd.Series(0.0, index=data.index)
+
+data["volume_target"] = volume_target
+
+returns_raw = close_original.pct_change()
+
+# === cechy z RAW close (price-based, przed pct_change) ===
+close_raw = data["Close_USDPLN"].copy()
+
+# momentum
+data["mom_3"] = close_raw.pct_change(3)
+data["mom_5"] = close_raw.pct_change(5)
+data["mom_10"] = close_raw.pct_change(10)
+
+# RSI
+delta = close_raw.diff()
+gain = delta.clip(lower=0).rolling(14).mean()
+loss = -delta.clip(upper=0).rolling(14).mean()
+rs = gain / loss.replace(0, np.nan)
+data["RSI"] = 100 - (100 / (1 + rs))
+
+# Bollinger position
+ma20 = close_raw.rolling(20).mean()
+std20 = close_raw.rolling(20).std()
+data["bb_pos"] = (close_raw - ma20) / std20.replace(0, np.nan)
+
+# rolling z-score na close
+data["zscore_20"] = (close_raw - close_raw.rolling(20).mean()) / close_raw.rolling(20).std().replace(0, np.nan)
+
+# ATR (volatility) — wymaga oryginalnych close/high/low
+tr = np.maximum(
+    high_original - low_original,
+    np.maximum(
+        abs(high_original - close_original.shift()),
+        abs(low_original - close_original.shift())
+    )
+)
+data["ATR"] = tr.rolling(14).mean()
+
+# opóźniony kierunek jako cecha (z RAW close pct_change)
+close_pct = close_original.pct_change()
+for lag in [1, 2, 3, 5]:
+    data[f"dir_lag_{lag}"] = np.sign(close_pct.shift(lag))
+
+# === konwersja Close_USDPLN i Close_EURPLN na returns ===
+data["Close_USDPLN"] = returns_raw
 data["Close_EURPLN"] = data["Close_EURPLN"].pct_change()
 
-#TODO dodac do modelu
-#rolling mean
-data["usd_ma_5"] = data["Close_USDPLN"].rolling(5).mean()
-data["usd_ma_10"] = data["Close_USDPLN"].rolling(10).mean()
-
-#volatility
+# === cechy z returns (return-based) ===
+# volatility rolling
 data["usd_volatility"] = data["Close_USDPLN"].rolling(10).std()
 
-#momentum
-data["usd_momentum"] = data["Close_USDPLN"] - data["Close_USDPLN"].shift(5)
-
-#spready
-data["eurusd_usdpln_ratio"] = data["Close_EURUSD"] / data["Close_USDPLN"]
-
 # cechy z High/Low/Volume (USDPLN) — zabezpieczone przed NaN
-volume_original = volume_original.fillna(0)
+volume_original_filled = volume_original.fillna(0)
 data["usd_daily_range"] = ((high_original - low_original) / close_original.replace(0, np.nan)).fillna(0)
 data["usd_hl_ratio"] = (high_original / low_original.replace(0, np.nan)).fillna(1)
-data["usd_volume_change"] = volume_original.pct_change().fillna(0)
-data["usd_volume_ma_5"] = (volume_original.rolling(5, min_periods=1).mean()
-                            / volume_original.rolling(20, min_periods=1).mean().replace(0, np.nan)).fillna(1)
+data["usd_volume_change"] = volume_original_filled.pct_change().fillna(0)
+data["usd_volume_ma_5"] = (volume_original_filled.rolling(5, min_periods=1).mean()
+                            / volume_original_filled.rolling(20, min_periods=1).mean().replace(0, np.nan)).fillna(1)
 
 data = data.replace([np.inf, -np.inf], np.nan)
 data = data.dropna()
 
 close_original = close_original.loc[data.index]
+target_raw = data["target"].values
+volume_target_raw = data["volume_target"].values
 
 #przygotowanie dla modelu LSTM
-# features = data.filter(["Close_USDPLN"])
 features = data.filter([
     "Close_USDPLN",
     "Close_EURPLN",
     "Close_EURUSD",
     "Close_EURGBP",
 
-    # nowe feature
-    "usd_ma_5",
-    "usd_ma_10",
+    # momentum
+    "mom_3",
+    "mom_5",
+    "mom_10",
+
+    # techniczne
+    "RSI",
+    "ATR",
+    "bb_pos",
     "usd_volatility",
-    "usd_momentum",
-    "eurusd_usdpln_ratio",
+    "zscore_20",
 
     # cechy z High/Low/Volume
     "usd_daily_range",
     "usd_hl_ratio",
     "usd_volume_change",
-    "usd_volume_ma_5"
+    "usd_volume_ma_5",
+
+    # stopy procentowe
+    "US_FED",
+    "EA_ECB",
+    "PL_NBP",
+
+    # opóźniony kierunek
+    "dir_lag_1",
+    "dir_lag_2",
+    "dir_lag_3",
+    "dir_lag_5"
 ])
 
-dataset = features.values #.reshape(-1, 1) #konwersja do np w wersji 2D
+dataset = features.values
 
-training_data_len = int(np.ceil(len(dataset) * 0.95))      #rozmiar zbioru testowego/treningowego
+training_data_len = int(np.ceil(len(dataset) * 0.95))
 
-
-#Preprocessing stages
+# Preprocessing stages
 scaler = StandardScaler()
-# scaler = MinMaxScaler()
 
-
-#dzielenie zbioru na testowy
+# dzielenie zbioru na testowy
 train_data = dataset[:training_data_len]
 test_data = dataset[training_data_len:]
 
-#skalowanie zbioru treningowego i testowego
+# target też dzielimy (NIE skalowany)
+train_target_price = target_raw[:training_data_len]
+train_target_volume = volume_target_raw[:training_data_len]
+
+# skalowanie zbioru treningowego i testowego
 scaled_train_data = scaler.fit_transform(train_data)
 scaled_test_data = scaler.transform(test_data)
 
-X_train, Y_train = [], []
+X_train, Y_train_price, Y_train_volume = [], [], []
+
+# create sliding windows, target z RAW wartości (procentowe)
+for i in range(sliding_window, len(scaled_train_data) - prediction_horizon + 1):
+    X_train.append(scaled_train_data[i-sliding_window:i, :])
+    Y_train_price.append(train_target_price[i - 1])
+    Y_train_volume.append(train_target_volume[i - 1])
+
+X_train = np.array(X_train)
+Y_train_price = np.array(Y_train_price)
+Y_train_volume = np.array(Y_train_volume)
+
+print(f"Class balance price: {np.mean(Y_train_price > 0)*100:.1f}% UP, {np.mean(Y_train_price <= 0)*100:.1f}% DOWN")
+
+# jawny podział train/validation (czasowy — bierzemy ostatnie 10% train)
+val_split = int(len(X_train) * 0.9)
+X_val, Y_val_price, Y_val_volume = X_train[val_split:], Y_train_price[val_split:], Y_train_volume[val_split:]
+X_train, Y_train_price, Y_train_volume = X_train[:val_split], Y_train_price[:val_split], Y_train_volume[:val_split]
+
+print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(test_data) - prediction_horizon + 1}")
+
+class TransformerBlock(keras.layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.rate = rate
+        self.att = keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = keras.Sequential([
+            keras.layers.Dense(ff_dim, activation="relu"),
+            keras.layers.Dense(embed_dim),
+        ])
+        self.layernorm1 = keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = keras.layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = keras.layers.Dropout(rate)
+        self.dropout2 = keras.layers.Dropout(rate)
+
+    def call(self, inputs, training=None):
+        attn_output = self.att(inputs, inputs, training=training)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1, training=training)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "embed_dim": self.embed_dim,
+            "num_heads": self.num_heads,
+            "ff_dim": self.ff_dim,
+            "rate": self.rate,
+        })
+        return config
 
 
-#create a sliding windows for our data oraz tworzymy dane wejsciowe
-for i in range(sliding_window, len(scaled_train_data)):
-    # Pobieramy wszystkie kolumny (USDPLN i EURPLN)
-    X_train.append(scaled_train_data[i-sliding_window:i, :]) 
-    # Przewidujemy tylko USDPLN (indeks 0)
-    Y_train.append(scaled_train_data[i, 0])
+# building MODEL — Hybryda LSTM + Transformer
+inputs = keras.layers.Input(shape=(X_train.shape[1], X_train.shape[2]))
+x = keras.layers.LSTM(32, return_sequences=True)(inputs)
+x = keras.layers.Dropout(0.2)(x)
+x = TransformerBlock(embed_dim=32, num_heads=2, ff_dim=32)(x)
+x = keras.layers.GlobalAveragePooling1D()(x)
+x = keras.layers.Dropout(0.2)(x)
 
-X_train, Y_train = np.array(X_train), np.array(Y_train)
-
-#tworzenie rozmiaru macierzy // zmieniane w zaleznosci od tego ile parametrow przyjmujemy - ostatniacyfra to liczba cech (features = 2)
-X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], dataset.shape[1]))
-
-
-#building MODEL
-model = keras.models.Sequential()
-
-model.add(keras.layers.LSTM(64, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])))
-model.add(keras.layers.Dropout(0.2)) 
-
-model.add(keras.layers.LSTM(64, return_sequences=False))
-
-model.add(keras.layers.Dense(64, activation="relu"))
-model.add(keras.layers.Dropout(0.2))            
-
-model.add(keras.layers.Dense(1))
-
+if volume_has_data:
+    price_out = keras.layers.Dense(1, name="price")(x)
+    volume_out = keras.layers.Dense(1, name="volume")(x)
+    model = keras.Model(inputs=inputs, outputs=[price_out, volume_out])
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0005),
+                  loss={"price": "mean_squared_error", "volume": "mean_squared_error"},
+                  loss_weights={"price": 1.0, "volume": 0.5},
+                  metrics={"price": "mean_absolute_error", "volume": "mean_absolute_error"})
+    train_targets = {"price": Y_train_price, "volume": Y_train_volume}
+    val_targets = {"price": Y_val_price, "volume": Y_val_volume}
+else:
+    price_out = keras.layers.Dense(1, name="price")(x)
+    model = keras.Model(inputs=inputs, outputs=price_out)
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0005),
+                  loss='mean_squared_error',
+                  metrics=['mean_absolute_error'])
+    train_targets = Y_train_price
+    val_targets = Y_val_price
 
 model.summary()
-model.compile(optimizer="adam", 
-              loss=keras.losses.Huber(delta=1.0), 
-              metrics=[
-                keras.metrics.MeanAbsoluteError(),
-                keras.metrics.MeanSquaredError(),
-                keras.metrics.RootMeanSquaredError()
-                ]
-            )
-#TODO: przetestowac funkcje straty loss="mse" lub loss=keras.losses.Huber(), loss="mae"
 
-
-# Early stopping które ma pomóc zapobiec overfittowaniu
+# Early stopping
 early_stop = keras.callbacks.EarlyStopping(
     monitor='val_loss',
-    patience=10,
+    patience=20,
     restore_best_weights=True
 )
 
 reduce_lr = keras.callbacks.ReduceLROnPlateau(
-    monitor='val_loss', 
-    factor=0.5,       # Zmniejsz learning rate o połowę, jeśli...
-    patience=4,       # ...przez 4 epoki val_loss nie maleje
+    monitor='val_loss',
+    factor=0.5,
+    patience=4,
     min_lr=0.00001,
     verbose=1
 )
 
-training = model.fit(X_train, 
-                     Y_train, 
-                     epochs=100, 
+training = model.fit(X_train,
+                     train_targets,
+                     epochs=100,
                      batch_size=32,
                      callbacks=[early_stop, reduce_lr],
-                     validation_split=0.1,
-                     shuffle=False
-                     )
+                     validation_data=(X_val, val_targets),
+                     shuffle=False)
 
-# połączenie końcówki train + test
+# połączenie końcówki train + test (żeby mieć pełne okno)
 test_inputs = np.concatenate(
     (scaled_train_data[-sliding_window:], scaled_test_data),
     axis=0
 )
 
+n_test = len(test_data) - prediction_horizon + 1
+Y_test_price = target_raw[training_data_len - 1 : training_data_len - 1 + n_test]
+Y_test_price = Y_test_price.reshape(-1, 1)
+Y_test_volume = volume_target_raw[training_data_len - 1 : training_data_len - 1 + n_test]
+Y_test_volume = Y_test_volume.reshape(-1, 1)
+
 X_test = []
-
-#to sa wartosci rzeczywiste do porownania
-Y_test = dataset[training_data_len:]
-
-for i in range(sliding_window, len(test_inputs)):
-    # ZMIANA: bierzemy wszystkie kolumny (:) a nie tylko indeks 0
-    X_test.append(test_inputs[i-sliding_window:i, :]) 
+for i in range(sliding_window, len(test_inputs) - prediction_horizon + 1):
+    X_test.append(test_inputs[i-sliding_window:i, :])
 
 X_test = np.array(X_test)
-
-# ZMIANA: ostatni wymiar to dataset.shape[1] (czyli 2)
 X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], dataset.shape[1]))
 
-
-
-#making predictions
+# predictions — multi-output (jeśli volume) lub single-output
 predictions = model.predict(X_test)
-#predictions = scaler.inverse_transform(predictions)
-training_predictions = model.predict(X_train)
-
-
-# Funkcja pomocnicza do odwracania skali dla jednej kolumny
-def inverse_transform_only_first(scaler, predictions, n_features):
-    # Tworzymy pustą macierz o szerokości oryginalnego datasetu
-    temp_mat = np.zeros((len(predictions), n_features))
-    # Wstawiamy nasze predykcje w pierwszą kolumnę (USDPLN)
-    temp_mat[:, 0] = predictions.flatten()
-    # Odwracamy skalowanie i wyciągamy tylko pierwszą kolumnę
-    return scaler.inverse_transform(temp_mat)[:, 0].reshape(-1, 1)
-
-# Użycie:
-predictions_inv = inverse_transform_only_first(scaler, predictions, dataset.shape[1])
-training_predictions_inv = inverse_transform_only_first(scaler, training_predictions, dataset.shape[1])
-
-
-
-
-
-
-#obliczanie jak bardzo model jest skuteczny #TODO sprawdz cyz mozna to latwiej zrobic
-
-# Bazowe targety (prawdziwe stopy zwrotu) w oryginalnej skali
-Y_train_inv = inverse_transform_only_first(scaler, Y_train.reshape(-1,1), dataset.shape[1])
-Y_test_inv = Y_test[:, 0].reshape(-1, 1) # Pierwsza kolumna to prawdziwe pct_change() dla USDPLN
-
-# REKONSTRUKCJA PRAWDZIWYCH CEN (PLN)
-# Ceny dla zbioru treningowego
-actual_train_prices = close_original.values[sliding_window:training_data_len]
-pred_train_prices = []
-for i in range(len(training_predictions_inv)):
-    # Cena(t) = Cena(t-1) * (1 + pred_pct_change)
-    prev_price = close_original.values[sliding_window + i - 1]
-    pred_train_prices.append(prev_price * (1 + training_predictions_inv[i, 0]))
-pred_train_prices = np.array(pred_train_prices).reshape(-1, 1)
-
-# Ceny dla zbioru testowego
-actual_test_prices = close_original.values[training_data_len:]
-pred_test_prices = []
-for i in range(len(predictions_inv)):
-    prev_price = close_original.values[training_data_len + i - 1]
-    pred_test_prices.append(prev_price * (1 + predictions_inv[i, 0]))
-pred_test_prices = np.array(pred_test_prices).reshape(-1, 1)
-
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
-print("\n" + "="*20 + " METRYKI STATYSTYCZNE " + "="*20)
-
-# Błędy dla stóp zwrotu (szum rynkowy)
-print(f"Test pct_change MAE:  {mean_absolute_error(Y_test_inv, predictions_inv):.5f}")
-
-# Błędy dla realnych cen w PLN (Najważniejsze!)
-test_rmse_pln = np.sqrt(mean_squared_error(actual_test_prices, pred_test_prices))
-test_mae_pln = mean_absolute_error(actual_test_prices, pred_test_prices)
-r2 = r2_score(actual_test_prices, pred_test_prices)
-
-print(f"Test Price RMSE:      {test_rmse_pln:.4f} PLN (Średni błąd kwadratowy)")
-print(f"Test Price MAE:       {test_mae_pln:.4f} PLN (Średnio o tyle groszy się myli)")
-print(f"Test R^2 Score:       {r2:.4f} (Im bliżej 1, tym lepszy model. Poniżej 0 = gorzej niż średnia)")
-
-
-print("\n" + "="*20 + " TRAFNOŚĆ KIERUNKU " + "="*20)
-
-# Kierunek rzeczywisty vs przewidywany
-true_direction = np.sign(Y_test_inv)
-pred_direction = np.sign(predictions_inv)
-
-# Trafność (procent poprawnych wskazań góra/dół)
-direction_accuracy = np.mean(true_direction == pred_direction) * 100
-print(f"Directional Accuracy: {direction_accuracy:.2f}%")
-
-
-print("\n" + "="*20 + " BENCHMARK (MODEL NAIWNY) " + "="*20)
-
-# Naiwna predykcja ceny: dzisiejsza cena jest predykcją na jutro
-naive_prices = close_original.values[training_data_len-1:-1]
-naive_rmse = np.sqrt(mean_squared_error(actual_test_prices, naive_prices))
-
-print(f"LSTM Model Price RMSE:   {test_rmse_pln:.4f} PLN")
-print(f"Naive Baseline RMSE:     {naive_rmse:.4f} PLN")
-
-if test_rmse_pln < naive_rmse:
-    print(f"SUKCES: Twój model LSTM jest lepszy niż najprostsza strategia punktu odniesienia! Jest lepszy o {naive_rmse - test_rmse_pln} PLN")
+if volume_has_data:
+    predictions_price = predictions[0]
+    predictions_volume = predictions[1]
 else:
-    print(f"PORAŻKA: Model przegrywa z prostym przesunięciem wykresu o 1 dzień. Zwiększ look_back lub zmień architekturę. Jest gorszy o {test_rmse_pln - naive_rmse} PLN")
+    predictions_price = predictions
+    predictions_volume = np.zeros_like(predictions_price)
+
+training_predictions = model.predict(X_train)
+if volume_has_data:
+    training_predictions_price = training_predictions[0]
+    training_predictions_volume = training_predictions[1]
+else:
+    training_predictions_price = training_predictions
+    training_predictions_volume = np.zeros_like(training_predictions_price)
+
+# kierunek ceny (dla benchmarków klasyfikacyjnych)
+predictions_dir = (predictions_price > 0).astype(int)
+training_predictions_dir = (training_predictions_price > 0).astype(int)
 
 
 
-# rekonstrukcja cen z prognoz pct_change
-actual_prices_clean = close_original
-train_dates = data['Date'].iloc[:training_data_len]
-test_dates = data['Date'].iloc[training_data_len:]
 
-actual_train_prices = actual_prices_clean.iloc[:training_data_len]
-actual_test_prices = actual_prices_clean.iloc[training_data_len:]
 
-# rekonstrukcja 1-krokowa: każda predykcja z rzeczywistej poprzedniej ceny
-actual_prev = close_original.iloc[training_data_len - 1 : -1].values
-pred_test_prices = actual_prev * (1 + predictions_inv.flatten())
+def simulate_strategy(Y_true_dir, Y_pred_dir, actual_returns):
+    print("\n" + "="*20 + " SYMULACJA STRATEGII " + "="*20)
 
-# 4. TWORZENIE WYKRESU
-plt.figure(figsize=(16, 9))
+    buy_hold = np.cumprod(1 + actual_returns) - 1
 
-#  Dane z pliku od początku do końca
-plt.plot(data['Date'], actual_prices_clean,
-         label="Dane z pliku (Całość)", color='yellow', alpha=0.6, linewidth=2)
+    # konwersja 0/1 na -1/1 do symulacji
+    trading_signals = 2 * Y_pred_dir.flatten() - 1
+    strat_returns = trading_signals * actual_returns
+    cumulative_strat = np.cumprod(1 + strat_returns) - 1
 
-# Wytrenowane dane treningowe
-plt.plot(train_dates, actual_train_prices,
-         label="Zbiór Treningowy (Actual)", color='green', linewidth=2)
+    print(f"Buy & Hold:           {buy_hold[-1]*100:.2f}%")
+    print(f"Strategia LSTM:       {cumulative_strat[-1]*100:.2f}%")
 
-# Dane predykcji testowej 
-plt.plot(test_dates, pred_test_prices,
-         label="LSTM Predictions (Test)", color='red', linestyle='--', linewidth=2)
+    if cumulative_strat[-1] > buy_hold[-1]:
+        print("SUKCES: Model pokonał Buy & Hold")
+    else:
+        print("PORAŻKA: Model nie pokonał Buy & Hold")
 
-# FORMATOWANIE OSI I WYŚWIETLANIE
-plt.title("USD/PLN - Porównanie danych rzeczywistych i predykcji LSTM")
-plt.xlabel("Data")
-plt.ylabel("Cena (PLN)")
-plt.legend()
-plt.grid(True, linestyle='--', alpha=0.5)
 
-# Bezpieczne formatowanie osi czasu
-plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-plt.gcf().autofmt_xdate()
+def naive_benchmark(Y_true_dir, Y_pred_dir):
+    print("\n" + "="*20 + " BENCHMARK " + "="*20)
 
-plt.show()
+    always_long = np.ones_like(Y_true_dir)
+    always_short = np.zeros_like(Y_true_dir)
+
+    print(f"LSTM Accuracy:  {accuracy_score(Y_true_dir, Y_pred_dir)*100:.2f}%")
+    print(f"Zawsze LONG:    {accuracy_score(Y_true_dir, always_long)*100:.2f}%")
+    print(f"Zawsze SHORT:   {accuracy_score(Y_true_dir, always_short)*100:.2f}%")
+
+    if accuracy_score(Y_true_dir, Y_pred_dir) > accuracy_score(Y_true_dir, always_long):
+        print("SUKCES: Model lepszy niż zawsze LONG")
+    else:
+        print("PORAŻKA: Model gorszy niż zawsze LONG")
+
+
+def plot_direction_signals(data, close_original, training_data_len,
+                           Y_test_dir, Y_pred_dir, prediction_horizon):
+    test_dates = data['Date'].iloc[training_data_len + prediction_horizon - 1:].values
+
+    plt.figure(figsize=(16, 9))
+    plt.plot(data['Date'], close_original, label="USD/PLN", color='yellow', alpha=0.5, linewidth=1)
+
+    buy_signals = Y_pred_dir.flatten() == 1
+    sell_signals = Y_pred_dir.flatten() == 0
+
+    plt.scatter(test_dates[buy_signals], close_original.iloc[training_data_len + prediction_horizon - 1:].values[buy_signals],
+                color='green', marker='^', s=30, label='KUP (LSTM)', alpha=0.6)
+    plt.scatter(test_dates[sell_signals], close_original.iloc[training_data_len + prediction_horizon - 1:].values[sell_signals],
+                color='red', marker='v', s=30, label='SPRZEDAJ (LSTM)', alpha=0.6)
+
+    plt.title(f"USD/PLN - Sygnały LSTM (horyzont: {prediction_horizon} dni)")
+    plt.xlabel("Data")
+    plt.ylabel("Cena (PLN)")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    plt.gcf().autofmt_xdate()
+    plt.show()
+
+
+def classification_metrics(Y_true, Y_pred):
+    print("\n" + "="*20 + " METRYKI KLASYFIKACJI " + "="*20)
+    print(f"Accuracy:  {accuracy_score(Y_true, Y_pred)*100:.2f}%")
+    print(f"Precision: {precision_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
+    print(f"Recall:    {recall_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
+    print(f"F1 Score:  {f1_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
+
+
+def show_confusion_matrix(Y_true, Y_pred):
+    print("\n" + "="*20 + " MACIERZ BŁĘDU " + "="*20)
+
+    cm = confusion_matrix(Y_true, Y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    print(f"TP (trafione wzrosty): {tp}")
+    print(f"TN (trafione spadki):  {tn}")
+    print(f"FP (fałszywe wzrosty): {fp}")
+    print(f"FN (fałszywe spadki):  {fn}")
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    print(f"\nPrecyzja wzrostów: {precision*100:.2f}%")
+    print(f"Czułość wzrostów:  {recall*100:.2f}%")
+
+
+# --- przygotowanie actual_returns do symulacji ---
+# forward_ret[t] = zwrot od t do t+prediction_horizon
+forward_ret = (close_original.shift(-prediction_horizon) / close_original - 1).values
+n_test_samples = len(X_test)
+actual_returns_test = forward_ret[training_data_len - 1 : training_data_len - 1 + n_test_samples]
+
+# forward_volume_ret[t] = zmiana wolumenu od t do t+prediction_horizon
+if volume_has_data:
+    forward_vol = (volume_original.shift(-prediction_horizon) / volume_original.replace(0, np.nan) - 1).values
+    actual_volume_test = forward_vol[training_data_len - 1 : training_data_len - 1 + n_test_samples]
+else:
+    actual_volume_test = np.zeros(n_test_samples)
+
+def regression_metrics(Y_true, Y_pred, nazwa):
+    print(f"\n{'='*20} METRYKI REGRESJI: {nazwa} {'='*20}")
+    print(f"MSE:  {mean_squared_error(Y_true, Y_pred):.6f}")
+    print(f"MAE:  {mean_absolute_error(Y_true, Y_pred):.6f}")
+    print(f"R2:   {r2_score(Y_true, Y_pred):.4f}")
+
+def direction_accuracy(Y_true, Y_pred, nazwa):
+    acc = accuracy_score((Y_true > 0).astype(int), (Y_pred > 0).astype(int))
+    print(f"Direction Accuracy ({nazwa}): {acc*100:.2f}%")
+
+# --- URUCHOMIENIE METRYK ---
+Y_test_dir_bin = (Y_test_price > 0).astype(int)
+
+print("\n" + "="*50)
+print("   METRYKI CENA (USD/PLN)")
+print("="*50)
+regression_metrics(Y_test_price, predictions_price, "CENA")
+direction_accuracy(Y_test_price, predictions_price, "CENA")
+
+if volume_has_data:
+    print("\n" + "="*50)
+    print("   METRYKI WOLUMEN")
+    print("="*50)
+    regression_metrics(Y_test_volume, predictions_volume, "WOLUMEN")
+    direction_accuracy(Y_test_volume, predictions_volume, "WOLUMEN")
+else:
+    print("\n(Brak danych wolumenu — metryki wolumenu pominięte)")
+
+print("\n" + "="*50)
+print("   METRYKI KIERUNKU CENY")
+print("="*50)
+classification_metrics(Y_test_dir_bin, predictions_dir)
+show_confusion_matrix(Y_test_dir_bin, predictions_dir)
+simulate_strategy(Y_test_dir_bin, predictions_dir, actual_returns_test)
+naive_benchmark(Y_test_dir_bin, predictions_dir)
+plot_direction_signals(data, close_original, training_data_len,
+                       Y_test_dir_bin, predictions_dir, prediction_horizon)
