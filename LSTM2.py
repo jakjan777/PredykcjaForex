@@ -16,7 +16,7 @@ np.random.seed(SEED)
 keras.utils.set_random_seed(SEED)
 
 sliding_window = 60
-prediction_horizon = 5
+prediction_horizon = 14
 
 sciezka_pliku = "dane_ekonomiczne.csv"
 data = pd.read_csv(sciezka_pliku)
@@ -326,28 +326,6 @@ predictions_dir = (predictions_price > 0).astype(int)
 training_predictions_dir = (training_predictions_price > 0).astype(int)
 
 
-
-
-
-def simulate_strategy(Y_true_dir, Y_pred_dir, actual_returns):
-    print("\n" + "="*20 + " SYMULACJA STRATEGII " + "="*20)
-
-    buy_hold = np.cumprod(1 + actual_returns) - 1
-
-    # konwersja 0/1 na -1/1 do symulacji
-    trading_signals = 2 * Y_pred_dir.flatten() - 1
-    strat_returns = trading_signals * actual_returns
-    cumulative_strat = np.cumprod(1 + strat_returns) - 1
-
-    print(f"Buy & Hold:           {buy_hold[-1]*100:.2f}%")
-    print(f"Strategia LSTM:       {cumulative_strat[-1]*100:.2f}%")
-
-    if cumulative_strat[-1] > buy_hold[-1]:
-        print("SUKCES: Model pokonał Buy & Hold")
-    else:
-        print("PORAŻKA: Model nie pokonał Buy & Hold")
-
-
 def naive_benchmark(Y_true_dir, Y_pred_dir):
     print("\n" + "="*20 + " BENCHMARK " + "="*20)
 
@@ -389,15 +367,6 @@ def plot_direction_signals(data, close_original, training_data_len,
     plt.gcf().autofmt_xdate()
     plt.show()
 
-
-def classification_metrics(Y_true, Y_pred):
-    print("\n" + "="*20 + " METRYKI KLASYFIKACJI " + "="*20)
-    print(f"Accuracy:  {accuracy_score(Y_true, Y_pred)*100:.2f}%")
-    print(f"Precision: {precision_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
-    print(f"Recall:    {recall_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
-    print(f"F1 Score:  {f1_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
-
-
 def show_confusion_matrix(Y_true, Y_pred):
     print("\n" + "="*20 + " MACIERZ BŁĘDU " + "="*20)
 
@@ -409,10 +378,13 @@ def show_confusion_matrix(Y_true, Y_pred):
     print(f"FP (fałszywe wzrosty): {fp}")
     print(f"FN (fałszywe spadki):  {fn}")
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    print(f"\nPrecyzja wzrostów: {precision*100:.2f}%")
-    print(f"Czułość wzrostów:  {recall*100:.2f}%")
+    print("\n" + "="*20 + " METRYKI KLASYFIKACJI " + "="*20)
+    print(f"Accuracy:  {accuracy_score(Y_true, Y_pred)*100:.2f}%")
+    print(f"Precision: {precision_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
+    print(f"Recall:    {recall_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
+    print(f"F1 Score:  {f1_score(Y_true, Y_pred, pos_label=1)*100:.2f}%")
+
+
 
 
 # --- przygotowanie actual_returns do symulacji ---
@@ -490,9 +462,8 @@ else:
 print("\n" + "="*50)
 print("   METRYKI KIERUNKU CENY")
 print("="*50)
-classification_metrics(Y_test_dir_bin, predictions_dir)
+
 show_confusion_matrix(Y_test_dir_bin, predictions_dir)
-simulate_strategy(Y_test_dir_bin, predictions_dir, actual_returns_test)
 naive_benchmark(Y_test_dir_bin, predictions_dir)
 plot_direction_signals(data, close_original, training_data_len,
                        Y_test_dir_bin, predictions_dir, prediction_horizon)
