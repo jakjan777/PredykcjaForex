@@ -34,6 +34,9 @@ data = data.drop(columns=["High_EURPLN", "Low_EURPLN", "Open_EURPLN", "Volume_EU
 data['Date'] = pd.to_datetime(data['Date'])
 data = data[~data['Date'].dt.dayofweek.isin([5, 6])].reset_index(drop=True)
 
+# opcjonalnie: ogranicz zakres dat (odkomentuj i zmień daty)
+# data = data[(data['Date'] >= "2022-01-01") & (data['Date'] <= "2023-12-31")].reset_index(drop=True)
+
 close_original = data["Close_USDPLN"].copy()
 high_original = data["High_USDPLN"].copy()
 low_original = data["Low_USDPLN"].copy()
@@ -366,7 +369,7 @@ def plot_direction_signals(data, close_original, training_data_len,
     test_dates = data['Date'].iloc[training_data_len + prediction_horizon - 1:].values
 
     plt.figure(figsize=(16, 9))
-    plt.plot(data['Date'], close_original, label="USD/PLN", color='yellow', alpha=0.5, linewidth=1)
+    plt.plot(data['Date'], close_original, label="USD/PLN", color='black', alpha=0.5, linewidth=1)
 
     buy_signals = Y_pred_dir.flatten() == 1
     sell_signals = Y_pred_dir.flatten() == 0
@@ -434,6 +437,37 @@ def regression_metrics(Y_true, Y_pred, nazwa):
 def direction_accuracy(Y_true, Y_pred, nazwa):
     acc = accuracy_score((Y_true > 0).astype(int), (Y_pred > 0).astype(int))
     print(f"Direction Accuracy ({nazwa}): {acc*100:.2f}%")
+
+# --- TABELA WYNIKÓW TESTU ---
+p_ceny = close_original.iloc[training_data_len - 1 : training_data_len - 1 + n_test].values
+p5_ceny = close_original.iloc[training_data_len - 1 + prediction_horizon : training_data_len - 1 + n_test + prediction_horizon].values
+przewidziane_p5 = p_ceny * (1 + predictions_price.flatten() / 100)
+
+tabela = pd.DataFrame({
+    "Data": data['Date'].iloc[training_data_len - 1 : training_data_len - 1 + n_test].values,
+    "Cena dziś": p_ceny,
+    "Przewidywane za 5d": przewidziane_p5,
+    "Rzeczywiste za 5d": p5_ceny,
+    "przewidywana zmiana procentowa": predictions_price.flatten(),
+    "rzeczywista zmiana procentowa": Y_test_price.flatten(),
+})
+print("\n" + "="*70)
+print("   TABELA WYNIKÓW (pierwsze 20 wierszy)")
+print("="*70)
+print(tabela.head(20).to_string(index=False))
+print(f"\nŁącznie wierszy: {len(tabela)}")
+
+print("\n" + "="*70)
+print("   OSTATNIE 5 PREDYKCJI")
+print("="*70)
+ostatnie = tabela.tail(5).copy()
+ostatnie["Data"] = ostatnie["Data"].astype(str)
+for _, w in ostatnie.iterrows():
+    print(f"{w['Data']}:  dziś={w['Cena dziś']:.4f}  "
+          f"przewidywane={w['Przewidywane za 5d']:.4f}  "
+          f"rzeczywiste={w['Rzeczywiste za 5d']:.4f}  "
+          f"prognoza={w['przewidywana zmiana procentowa']:+.2f}%  "
+          f"fakt={w['rzeczywista zmiana procentowa']:+.2f}%")
 
 # --- URUCHOMIENIE METRYK ---
 Y_test_dir_bin = (Y_test_price > 0).astype(int)
