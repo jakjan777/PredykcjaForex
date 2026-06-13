@@ -54,3 +54,14 @@ python main_gui.py
 ```
 
 Parametry eksperymentów (okno czasowe, learning rate, dropout, liczba głów attention) można zmieniać bezpośrednio w `LSTM.py`.
+
+## Wyniki (konfiguracja bazowa)
+
+| Metryka | Wartość |
+|---|---|
+| Accuracy | 64,32% |
+| Precision | 63,22% |
+| Recall | 83,33% |
+| F1 | 71,90% |
+
+Model przewyższa naiwny benchmark „zawsze LONG” (54,77%). Szczegóły eksperymentów E1–E4 (okno, głowy attention, learning rate, dropout) — w dokumentacji PDF.
